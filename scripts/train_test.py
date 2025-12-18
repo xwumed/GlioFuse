@@ -10,9 +10,13 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 # 导入核心模块
 from data_loaders import MriWsiDataset, create_standardized_datasets
-# 【修改】导入 BaseFusionModel 以便进行类型检查
-from networks import define_net, define_scheduler, BaseFusionModel, MultiScaleFusionNet 
+from networks import define_net, define_scheduler
 from utils import CoxLoss, CIndex_lifeline, cox_log_rank, accuracy_cox, calculate_l1_reg, count_parameters, integrated_auc, integrated_brier_score, clinical_timepoints_auc
+
+# 判断是否为融合模型的辅助函数
+def is_fusion_model(model):
+    """检查模型是否为融合模型（具有 path_encoder 和 rad_encoder 属性）"""
+    return hasattr(model, 'path_encoder') and hasattr(model, 'rad_encoder')
 
 # =======================================================================================
 # 1. 早停机制 (Early Stopping) - 保持不变
@@ -87,8 +91,8 @@ def train(opt, data, device, k):
     model = define_net(opt, k)
     
     # --- 2. 【关键修正】根据模型类型选择优化器 ---
-    # 检查模型是否是 BaseFusionModel 的子类 (即多模态融合模型)
-    if isinstance(model, BaseFusionModel):
+    # 检查模型是否为融合模型
+    if is_fusion_model(model):
         print("  - ⚙️  检测到融合模型，正在为全模型微调模式设置差分学习率...")
         
         encoder_prefixes = ('path_encoder', 'rad_encoder', 'path_encoder_fine', 'rad_encoder_fine', 'rad_reducer_fine')
@@ -200,7 +204,7 @@ def train(opt, data, device, k):
 
     # 可选：冻结编码器若干 epoch（仅适用于融合模型）
     freeze_epochs = int(getattr(opt, 'freeze_encoder_epochs', 0))
-    if isinstance(model, BaseFusionModel) and freeze_epochs > 0:
+    if is_fusion_model(model) and freeze_epochs > 0:
         for p in model.path_encoder.parameters():
             p.requires_grad = False
         for p in model.rad_encoder.parameters():
@@ -231,9 +235,9 @@ def train(opt, data, device, k):
             input_data = {'x_path': x_path, 'x_rad': x_rad}
             model_output = model(**input_data)
             
-            # 解析模型输出 - 支持新的CoAttentionFusionNet格式
+            # 解析模型输出 - 支持多种融合模型格式
             if isinstance(model_output, tuple) and len(model_output) == 5:
-                # 新的CoAttentionFusionNet格式: (features_tuple, logits, align_loss, attention_weights, sig_outputs)
+                # 扩展格式: (features_tuple, logits, align_loss, attention_weights, sig_outputs)
                 features_tuple, logits, model_align_loss, attention_weights, sig_outputs = model_output
                 fused_features, attn_entropy, path_z, rad_z = features_tuple
             elif isinstance(model_output, tuple) and len(model_output) == 2:
@@ -285,9 +289,10 @@ def train(opt, data, device, k):
                 loss_align_outer = torch.mean((path_z - rad_z) ** 2) * align_w_outer
             
             # 注意力熵正则（仅 WeightedFusionNet 返回）
+            # 注意：LateFusionNet 返回的是 fusion_info 字典，需要类型检查
             attn_entropy_w = float(getattr(opt, 'attn_entropy_weight', 0.0))
             loss_attn_entropy = torch.tensor(0.0, device=device)
-            if attn_entropy_w > 0.0 and attn_entropy is not None:
+            if attn_entropy_w > 0.0 and attn_entropy is not None and isinstance(attn_entropy, torch.Tensor):
                 loss_attn_entropy = -attn_entropy  # 最大化熵 -> 最小化 -熵
             
             # Signature网络损失 (如果启用)
@@ -340,7 +345,7 @@ def train(opt, data, device, k):
             break
 
         # 解冻编码器
-        if isinstance(model, BaseFusionModel) and freeze_epochs > 0 and epoch == freeze_epochs:
+        if is_fusion_model(model) and freeze_epochs > 0 and epoch == freeze_epochs:
             for p in model.path_encoder.parameters():
                 p.requires_grad = True
             for p in model.rad_encoder.parameters():
@@ -388,9 +393,9 @@ def test(opt, model, test_dataset, device):
             input_data = {'x_path': x_path, 'x_rad': x_rad}
             model_output = model(**input_data)
             
-            # 解析模型输出 - 支持新的CoAttentionFusionNet格式
+            # 解析模型输出 - 支持多种融合模型格式
             if isinstance(model_output, tuple) and len(model_output) == 5:
-                # 新的CoAttentionFusionNet格式: (features_tuple, logits, align_loss, attention_weights, sig_outputs)
+                # 扩展格式: (features_tuple, logits, align_loss, attention_weights, sig_outputs)
                 _, logits, _, _, _ = model_output
             elif isinstance(model_output, tuple) and len(model_output) == 2:
                 # 标准格式: (features_tuple, logits)

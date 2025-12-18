@@ -41,7 +41,7 @@ def run_cv_experiment(opt, parser=None, trial=None):
     
     # --- 针对融合模型的默认正则范围：优先只约束融合层/分类头 ---
     try:
-        fusion_modes = ['simple_fusion', 'multiscale_fusion', 'coattn', 'bilinear_fusion']
+        fusion_modes = ['EarlyFusionNet', 'BilinearFusionNet', 'LateFusionNet']
         if getattr(opt, 'mode', None) in fusion_modes:
             current_reg = getattr(opt, 'reg_type', 'rad')
             if current_reg in ['rad', 'path']:
@@ -260,297 +260,6 @@ def evaluate_folds_on_external(opt_exp, external_test_data_raw, logger):
     return mean_cindex, std_cindex, mean_iauc, std_iauc, mean_ibrier, std_ibrier, timepoint_auc_stats, aggregated_results
 
 
-# =======================================================================================
-# 新增：后融合（late_fusion）评估工具
-# =======================================================================================
-def _build_opt_for_model(args, model_mode, base_parser):
-    """根据 args 构建用于加载指定模型的 opt（不一定训练）。"""
-    from options import parse_gpuids, normalize_mode, to_simplified_mode
-    from config import OPTIMIZED_HYPERPARAMS
-    opt = base_parser.parse_args([])
-    opt.exp_name = args.exp_name if args.exp_name != 'fusion_experiment' else ('optimized_evaluation' if args.use_optimized else 'baseline_evaluation')
-    internal_mode = normalize_mode(model_mode)
-    opt.mode = internal_mode
-    # 继承与主运行一致的基础参数
-    for k, v in vars(args).items():
-        setattr(opt, k, v)
-    # 覆盖优化超参（若选择使用）
-    if getattr(args, 'use_optimized', False) and internal_mode in OPTIMIZED_HYPERPARAMS:
-        for k, v in OPTIMIZED_HYPERPARAMS[internal_mode].items():
-            setattr(opt, k, v)
-    # 一致的模型命名策略（不追加 _optimized 后缀，统一目录命名）
-    opt.model_name = to_simplified_mode(internal_mode)
-    opt = parse_gpuids(opt)
-    return opt
-
-
-def _weights_path_for(opt, fold_idx):
-    import os
-    return os.path.join(opt.checkpoints_dir, opt.exp_name, opt.model_name, f'split_{fold_idx}_best_weights.pt')
-
-
-def _ensure_unimodal_models_trained(args, base_parser, logger):
-    """若缺少后融合所需的单模态权重，则自动训练对应模型。"""
-    from os.path import exists
-    # 构建两个单模态配置
-    opt_rad = _build_opt_for_model(args, 'rad_only', base_parser)
-    opt_path = _build_opt_for_model(args, 'path_only', base_parser)
-    need_train_rad = not exists(_weights_path_for(opt_rad, 0))
-    need_train_path = not exists(_weights_path_for(opt_path, 0))
-    if not (need_train_rad or need_train_path):
-        return opt_rad, opt_path
-    logger.info("Late fusion requires unimodal weights. Missing detected -> training needed.")
-    # 训练缺失者
-    if need_train_rad:
-        logger.info("Training missing unimodal model: rad_only ...")
-        run_cv_experiment(opt=opt_rad, parser=base_parser, trial=None)
-    if need_train_path:
-        logger.info("Training missing unimodal model: path_only ...")
-        run_cv_experiment(opt=opt_path, parser=base_parser, trial=None)
-    return opt_rad, opt_path
-
-
-def evaluate_late_fusion_on_cv(args, base_parser, logger):
-    """在K折CV上评估后融合（rad_only + path_only 风险平均）。"""
-    import os
-    import numpy as np
-    import torch
-    from config import CV_SPLITS_DIR, N_SPLITS
-    from data_loaders import MriWsiDataset
-    from networks import define_net
-    from utils import CIndex_lifeline, integrated_auc, integrated_brier_score
-
-    # 确保单模态权重可用
-    opt_rad, opt_path = _ensure_unimodal_models_trained(args, base_parser, logger)
-
-    device = torch.device(f'cuda:{opt_rad.gpu_ids[0]}') if opt_rad.gpu_ids and torch.cuda.is_available() else torch.device('cpu')
-
-    train_cis, val_cis = [], []
-    train_iaucs, val_iaucs = [], []
-    train_ibriers, val_ibriers = [], []
-    fold_results = []
-
-    for k in range(N_SPLITS):
-        # 加载当前折数据并构建scaler
-        import pickle
-        split_data_path = os.path.join(CV_SPLITS_DIR, f'split_{k}_data.pkl')
-        try:
-            with open(split_data_path, 'rb') as f:
-                fold_data = pickle.load(f)
-        except FileNotFoundError:
-            logger.warning(f"Could not find {split_data_path}, skipping fold {k}.")
-            continue
-
-        train_dataset_for_scaler = MriWsiDataset(opt_rad, fold_data, split='train')
-        scalers = train_dataset_for_scaler.get_scalers()
-        val_dataset = MriWsiDataset(opt_rad, fold_data, split='test', scalers=scalers)
-        tr_dataset = MriWsiDataset(opt_rad, fold_data, split='train', scalers=scalers)
-
-        # 加载两个单模态模型
-        m_rad = define_net(opt_rad, k)
-        m_path = define_net(opt_path, k)
-        rad_w = _weights_path_for(opt_rad, k)
-        path_w = _weights_path_for(opt_path, k)
-        if not (os.path.exists(rad_w) and os.path.exists(path_w)):
-            logger.warning(f"Missing weights for fold {k}: rad_only -> {rad_w}, path_only -> {path_w}. Skipping fold.")
-            continue
-        m_rad.load_state_dict(torch.load(rad_w, map_location='cpu'))
-        m_path.load_state_dict(torch.load(path_w, map_location='cpu'))
-        m_rad.to(device); m_path.to(device)
-
-        # 在验证集上评估并融合
-        _, _, _, _, _, _, _, raw_rad_val = test(opt_rad, m_rad, val_dataset, device)
-        _, _, _, _, _, _, _, raw_path_val = test(opt_path, m_path, val_dataset, device)
-        pred_val = (np.array(raw_rad_val[0]) + np.array(raw_path_val[0])) / 2.0
-        surv_val = np.array(raw_rad_val[1]); cens_val = np.array(raw_rad_val[2])
-        ci_val = CIndex_lifeline(pred_val, cens_val, surv_val)
-        iauc_val = integrated_auc(pred_val, cens_val, surv_val)
-        ibrier_val = integrated_brier_score(pred_val, cens_val, surv_val)
-
-        # 在训练集上评估并融合
-        _, _, _, _, _, _, _, raw_rad_tr = test(opt_rad, m_rad, tr_dataset, device)
-        _, _, _, _, _, _, _, raw_path_tr = test(opt_path, m_path, tr_dataset, device)
-        pred_tr = (np.array(raw_rad_tr[0]) + np.array(raw_path_tr[0])) / 2.0
-        surv_tr = np.array(raw_rad_tr[1]); cens_tr = np.array(raw_rad_tr[2])
-        ci_tr = CIndex_lifeline(pred_tr, cens_tr, surv_tr)
-        iauc_tr = integrated_auc(pred_tr, cens_tr, surv_tr)
-        ibrier_tr = integrated_brier_score(pred_tr, cens_tr, surv_tr)
-
-        train_cis.append(ci_tr); val_cis.append(ci_val)
-        train_iaucs.append(iauc_tr); val_iaucs.append(iauc_val)
-        train_ibriers.append(ibrier_tr); val_ibriers.append(ibrier_val)
-        fold_results.append({'fold': k + 1, 'train_cindex': ci_tr, 'val_cindex': ci_val, 'train_iauc': iauc_tr, 'val_iauc': iauc_val, 'train_ibrier': ibrier_tr, 'val_ibrier': ibrier_val})
-
-        logger.info(f"  - [LateFusion] Fold {k+1}: Train CI={ci_tr:.4f}, Val CI={ci_val:.4f}, Val I-AUC={iauc_val:.4f}, Val I-Brier={ibrier_val:.4f}")
-
-    if not val_cis:
-        logger.warning("Late fusion CV evaluation failed: no valid folds.")
-        return {}
-
-    results = {
-        'mean_train_cindex': float(np.mean(train_cis)),
-        'std_train_cindex': float(np.std(train_cis)),
-        'mean_val_cindex': float(np.mean(val_cis)),
-        'std_val_cindex': float(np.std(val_cis)),
-        'mean_train_iauc': float(np.mean(train_iaucs)),
-        'std_train_iauc': float(np.std(train_iaucs)),
-        'mean_val_iauc': float(np.mean(val_iaucs)),
-        'std_val_iauc': float(np.std(val_iaucs)),
-        'mean_train_ibrier': float(np.mean(train_ibriers)),
-        'std_train_ibrier': float(np.std(train_ibriers)),
-        'mean_val_ibrier': float(np.mean(val_ibriers)),
-        'std_val_ibrier': float(np.std(val_ibriers)),
-        'fold_results': fold_results,
-    }
-    # 保存每折 CV 结果（训练/验证）
-    try:
-        import pandas as _pd
-        model_dir = os.path.join(opt_rad.checkpoints_dir, opt_rad.exp_name, 'LateFusionNet')
-        os.makedirs(model_dir, exist_ok=True)
-        _pd.DataFrame(fold_results).to_csv(os.path.join(model_dir, 'cv_results.csv'), index=False, float_format='%.6f')
-    except Exception as e:
-        logger.warning(f"Failed to save LateFusionNet CV results CSV: {e}")
-    return results
-
-
-def evaluate_late_fusion_on_external(args, external_test_data_raw, base_parser, logger):
-    """在外部测试集上评估后融合（rad_only + path_only 风险平均）。"""
-    import os
-    import numpy as np
-    import torch
-    from config import CV_SPLITS_DIR, N_SPLITS
-    from data_loaders import MriWsiDataset
-    from networks import define_net
-    from utils import CIndex_lifeline, integrated_auc, integrated_brier_score, clinical_timepoints_auc
-    import pickle
-
-    # 确保单模态权重可用
-    opt_rad, opt_path = _ensure_unimodal_models_trained(args, base_parser, logger)
-
-    device = torch.device(f'cuda:{opt_rad.gpu_ids[0]}') if opt_rad.gpu_ids and torch.cuda.is_available() else torch.device('cpu')
-
-    all_fold_predictions = []
-    all_fold_survtimes = []
-    all_fold_censors = []
-
-    cindex_results = []
-    iauc_results = []
-    ibrier_results = []
-    timepoint_auc_results = {}
-
-    per_fold_rows = []
-    for k in range(N_SPLITS):
-        split_data_path = os.path.join(CV_SPLITS_DIR, f'split_{k}_data.pkl')
-        try:
-            with open(split_data_path, 'rb') as f:
-                fold_data = pickle.load(f)
-        except FileNotFoundError:
-            logger.warning(f"Could not find {split_data_path}, skipping fold {k}.")
-            continue
-
-        # 拿到训练scaler并应用到外部集
-        train_dataset_for_scaler = MriWsiDataset(opt_rad, fold_data, split='train')
-        scalers = train_dataset_for_scaler.get_scalers()
-        external_dataset = MriWsiDataset(opt_rad, {'test': external_test_data_raw}, 'test', scalers)
-
-        # 加载两个模型
-        m_rad = define_net(opt_rad, k)
-        m_path = define_net(opt_path, k)
-        rad_w = _weights_path_for(opt_rad, k)
-        path_w = _weights_path_for(opt_path, k)
-        if not (os.path.exists(rad_w) and os.path.exists(path_w)):
-            logger.warning(f"Missing weights for fold {k}: rad_only -> {rad_w}, path_only -> {path_w}. Skipping fold.")
-            continue
-        m_rad.load_state_dict(torch.load(rad_w, map_location='cpu'))
-        m_path.load_state_dict(torch.load(path_w, map_location='cpu'))
-        m_rad.to(device); m_path.to(device)
-
-        # 分别预测并后融合
-        _, _, _, _, _, _, timepoint_aucs_rad, raw_rad = test(opt_rad, m_rad, external_dataset, device)
-        _, _, _, _, _, _, timepoint_aucs_path, raw_path = test(opt_path, m_path, external_dataset, device)
-        pred = (np.array(raw_rad[0]) + np.array(raw_path[0])) / 2.0
-        surv = np.array(raw_rad[1]); cens = np.array(raw_rad[2])
-
-        cindex_test = CIndex_lifeline(pred, cens, surv)
-        iauc_test = integrated_auc(pred, cens, surv)
-        ibrier_test = integrated_brier_score(pred, cens, surv)
-        t_auc = clinical_timepoints_auc(pred, cens, surv)
-
-        all_fold_predictions.append(pred)
-        all_fold_survtimes.append(surv)
-        all_fold_censors.append(cens)
-
-        cindex_results.append(cindex_test)
-        iauc_results.append(iauc_test)
-        ibrier_results.append(ibrier_test)
-
-        if not timepoint_auc_results:
-            timepoint_auc_results = {tp: [] for tp in t_auc.keys()}
-        for tp, auc_val in t_auc.items():
-            timepoint_auc_results[tp].append(auc_val)
-
-        logger.info(f"  - [LateFusion] Fold {k+1} external: C-Index={cindex_test:.4f}, I-AUC={iauc_test:.4f}, I-Brier={ibrier_test:.4f}")
-        per_fold_rows.append({
-            'fold': k + 1,
-            'test_cindex': float(cindex_test),
-            'test_iauc': float(iauc_test),
-            'test_ibrier': float(ibrier_test),
-            'auc_1-year': float(t_auc.get('1-year', float('nan'))),
-            'auc_2-year': float(t_auc.get('2-year', float('nan'))),
-            'auc_3-year': float(t_auc.get('3-year', float('nan'))),
-            'auc_5-year': float(t_auc.get('5-year', float('nan'))),
-        })
-
-    if not cindex_results:
-        logger.warning("No valid folds for late fusion external evaluation.")
-        return float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), float('nan'), {}, {}
-
-    mean_cindex = float(np.mean(cindex_results)); std_cindex = float(np.std(cindex_results))
-    mean_iauc = float(np.mean(iauc_results)); std_iauc = float(np.std(iauc_results))
-    mean_ibrier = float(np.mean(ibrier_results)); std_ibrier = float(np.std(ibrier_results))
-
-    timepoint_auc_stats = {tp: {'mean': float(np.nanmean(vals)), 'std': float(np.nanstd(vals))} for tp, vals in timepoint_auc_results.items()}
-
-    # 聚合模式
-    from utils import CIndex_lifeline as _C, integrated_auc as _IA, integrated_brier_score as _IB, clinical_timepoints_auc as _CTA
-    avg_predictions = np.mean(all_fold_predictions, axis=0)
-    final_survtime = all_fold_survtimes[0]
-    final_censor = all_fold_censors[0]
-    aggregated_cindex = _C(avg_predictions, final_censor, final_survtime)
-    aggregated_iauc = _IA(avg_predictions, final_censor, final_survtime)
-    aggregated_ibrier = _IB(avg_predictions, final_censor, final_survtime)
-    aggregated_timepoint_aucs = _CTA(avg_predictions, final_censor, final_survtime)
-
-    predictions_save_dir = os.path.join(opt_rad.checkpoints_dir, opt_rad.exp_name, 'aggregated_predictions')
-    os.makedirs(predictions_save_dir, exist_ok=True)
-    import pandas as pd
-    predictions_save_path_pkl = os.path.join(predictions_save_dir, 'late_fusion_aggregated_predictions.pkl')
-    predictions_save_path_csv = os.path.join(predictions_save_dir, 'late_fusion_aggregated_predictions.csv')
-    with open(predictions_save_path_pkl, 'wb') as f:
-        import pickle as _p
-        _p.dump({'predictions': avg_predictions, 'survtime': final_survtime, 'censor': final_censor, 'model_name': 'late_fusion', 'exp_name': opt_rad.exp_name}, f)
-    pd.DataFrame({'aggregated_prediction': avg_predictions, 'survival_time': final_survtime, 'censor_status': final_censor, 'model_name': 'late_fusion', 'experiment_name': opt_rad.exp_name}).to_csv(predictions_save_path_csv, index=False, float_format='%.6f')
-
-    # 保存每折外部测试结果（LateFusionNet）
-    try:
-        import pandas as _pd
-        model_dir = os.path.join(opt_rad.checkpoints_dir, opt_rad.exp_name, 'LateFusionNet')
-        os.makedirs(model_dir, exist_ok=True)
-        _pd.DataFrame(per_fold_rows).to_csv(os.path.join(model_dir, 'external_results.csv'), index=False, float_format='%.6f')
-    except Exception as e:
-        logger.warning(f"Failed to save LateFusionNet external results CSV: {e}")
-
-    aggregated_results = {
-        'cindex': aggregated_cindex,
-        'iauc': aggregated_iauc,
-        'ibrier': aggregated_ibrier,
-        'timepoint_aucs': aggregated_timepoint_aucs,
-        'predictions_path_pkl': predictions_save_path_pkl,
-        'predictions_path_csv': predictions_save_path_csv,
-    }
-
-    return mean_cindex, std_cindex, mean_iauc, std_iauc, mean_ibrier, std_ibrier, timepoint_auc_stats, aggregated_results
-
 def load_external_test_data(logger):
     """加载外部测试集数据。"""
     external_test_path = os.path.join(EXTERNAL_DATA_DIR, 'external_test_data.pkl')
@@ -571,10 +280,9 @@ def main():
     base_parser = get_base_parser()
     base_parser.add_argument('--use_optimized', action='store_true', default=True, help="Use optimized hyperparameters (default: True)")
     base_parser.add_argument('--use_baseline', action='store_true', help="Use baseline hyperparameters instead of optimized")
-    all_model_modes = [exp['params']['mode'] for exp in BASELINE_EXPERIMENTS]
-    simplified_defaults = [to_simplified_mode(m) for m in all_model_modes]
-    extended_modes = simplified_defaults + ['LateFusionNet']
-    base_parser.add_argument('--models_to_run', nargs='+', type=str, default=extended_modes, help="Specify models to run (support 'LateFusionNet')")
+    # 使用实验名称（exp['name']）作为默认运行列表，这样可以区分同一模型的不同变体
+    all_model_names = [exp['name'] for exp in BASELINE_EXPERIMENTS]
+    base_parser.add_argument('--models_to_run', nargs='+', type=str, default=all_model_names, help="Specify models to run")
     base_parser.add_argument('--pretrain_exp_name', type=str, default='', help='Experiment name containing pretrained weights')
     args = base_parser.parse_args()
     
@@ -595,62 +303,38 @@ def main():
 
     # 2. 选择参数来源 (默认使用优化参数)
     if args.use_optimized:
-        # keys 为内部模式名
-        experiments_source = {model: {'name': f"{to_simplified_mode(model)}", 'params': params} for model, params in OPTIMIZED_HYPERPARAMS.items()}
+        # 使用 OPTIMIZED_HYPERPARAMS，键为模型名（含变体后缀）
+        experiments_source = {model: {'name': model, 'params': params} for model, params in OPTIMIZED_HYPERPARAMS.items()}
     else:
-        experiments_source = {exp['params']['mode']: exp for exp in BASELINE_EXPERIMENTS}
+        # 使用 BASELINE_EXPERIMENTS，键为实验名
+        experiments_source = {exp['name']: exp for exp in BASELINE_EXPERIMENTS}
 
     all_final_results = []
     # 3. 循环执行实验
-    for model_mode_in in args.models_to_run:
-        mode_internal = normalize_mode(model_mode_in)
-        mode_display = to_simplified_mode(mode_internal)
-        if mode_internal == 'late_fusion':
-            logger.info(f"\n{'='*80}\n➡️  Running Experiment: LateFusionNet\n{'='*80}")
-            # CV评估（不训练）
-            cv_results = evaluate_late_fusion_on_cv(args, base_parser, logger)
-            # 外部评估
-            mean_ext_ci, std_ext_ci, mean_ext_iauc, std_ext_iauc, mean_ext_ibrier, std_ext_ibrier, timepoint_auc_stats, aggregated_results = evaluate_late_fusion_on_external(args, external_data_raw, base_parser, logger)
-            result_dict = {
-                'Model Architecture': 'LateFusionNet',
-                'CV Train C-Index': cv_results.get('mean_train_cindex', float('nan')),
-                'CV Val C-Index': cv_results.get('mean_val_cindex', float('nan')),
-                'CV Val Std': cv_results.get('std_val_cindex', float('nan')),
-                'CV Train I-AUC': cv_results.get('mean_train_iauc', float('nan')),
-                'CV Val I-AUC': cv_results.get('mean_val_iauc', float('nan')),
-                'CV Train I-Brier': cv_results.get('mean_train_ibrier', float('nan')),
-                'CV Val I-Brier': cv_results.get('mean_val_ibrier', float('nan')),
-                'External Test C-Index': mean_ext_ci,
-                'External Test Std': std_ext_ci,
-                'External Test I-AUC': mean_ext_iauc,
-                'External Test I-AUC Std': std_ext_iauc,
-                'External Test I-Brier': mean_ext_ibrier,
-                'External Test I-Brier Std': std_ext_ibrier,
-            }
-            for timepoint, stats in timepoint_auc_stats.items():
-                result_dict[f'External Test {timepoint} AUC'] = stats['mean']
-                result_dict[f'External Test {timepoint} AUC Std'] = stats['std']
-            result_dict['External Test C-Index (Aggregated)'] = aggregated_results['cindex']
-            result_dict['External Test I-AUC (Aggregated)'] = aggregated_results['iauc']
-            result_dict['External Test I-Brier (Aggregated)'] = aggregated_results['ibrier']
-            for timepoint, auc_value in aggregated_results['timepoint_aucs'].items():
-                result_dict[f'External Test {timepoint} AUC (Aggregated)'] = auc_value
-            all_final_results.append(result_dict)
+    for model_name_in in args.models_to_run:
+        # 直接使用模型名查找配置
+        if model_name_in not in experiments_source:
+            logger.warning(f"Configuration for model '{model_name_in}' not found in source, skipping.")
             continue
-
-        # 常规模型路径
-        if mode_internal not in experiments_source:
-            logger.warning(f"Configuration for model '{model_mode_in}' not found in source, skipping.")
-            continue
-        exp_config = experiments_source[mode_internal]
-        logger.info(f"\n{'='*80}\n➡️  Running Experiment: {to_simplified_mode(mode_internal)}\n{'='*80}")
+        exp_config = experiments_source[model_name_in]
+        logger.info(f"\n{'='*80}\n➡️  Running Experiment: {model_name_in}\n{'='*80}")
 
         opt = base_parser.parse_args([]) # Create a fresh opt object
         opt.exp_name = EVALUATION_NAME
-        opt.mode = mode_internal
+        # 继承命令行参数
         for key, value in vars(args).items(): setattr(opt, key, value)
+        # 应用配置中的参数
         for key, value in exp_config['params'].items(): setattr(opt, key, value)
-        opt.model_name = mode_display
+        # 如果 mode 未设置，根据模型名推断（去掉 _avg, _weighted 等后缀）
+        if not hasattr(opt, 'mode') or not opt.mode:
+            base_mode = model_name_in.split('_')[0] if '_' in model_name_in else model_name_in
+            # 处理特殊情况：LateFusionNet_avg -> LateFusionNet
+            if model_name_in.startswith('LateFusionNet'):
+                opt.mode = 'LateFusionNet'
+            else:
+                opt.mode = base_mode
+        # 使用完整的模型名（含变体后缀）作为保存目录名
+        opt.model_name = model_name_in
         opt = parse_gpuids(opt)
 
         cv_results = run_cv_experiment(opt=opt, parser=base_parser, trial=None)

@@ -11,67 +11,39 @@ from config import (
 
 
 # ================================================================
-# 模型命名别名与工具函数（简洁命名 ↔ 内部模式名）
+# 模型命名工具函数
 # ================================================================
-# 规范化：
-#  - 内部模式名（旧）：'rad_only','path_only','simple_fusion','multiscale_fusion','coattn','bilinear_fusion','late_fusion'
-#  - 简洁显示名（新）：'RadNet','PathNet','EarlyFusionNet','MultiScaleFusionNet','CoAttentionNet','BilinearFusion','LateFusion'
+# 统一使用类名作为模式名：
+#   'PathNet', 'RadNet', 'EarlyFusionNet', 'BilinearFusionNet', 'LateFusionNet'
+#   LateFusionNet 支持变体：LateFusionNet_A (avg), LateFusionNet_W (weighted)
 
-_INTERNAL_TO_SIMPLIFIED = {
-    'rad_only': 'RadNet',
-    'path_only': 'PathNet',
-    'simple_fusion': 'EarlyFusionNet',
-    'multiscale_fusion': 'MultiScaleFusionNet',
-    'coattn': 'CoAttentionNet',
-    'bilinear_fusion': 'BilinearFusionNet',
-    'late_fusion': 'LateFusionNet',
-}
+# 基础模式名（对应网络类）
+BASE_MODES = ['PathNet', 'RadNet', 'EarlyFusionNet', 'BilinearFusionNet', 'LateFusionNet']
 
-_SIMPLIFIED_TO_INTERNAL = {
-    'radnet': 'rad_only',
-    'pathnet': 'path_only',
-    'earlyfusionnet': 'simple_fusion',
-    'multiscalefusionnet': 'multiscale_fusion',
-    'coattentionnet': 'coattn',
-    'coattention': 'coattn',
-    'coattnnet': 'coattn',
-    'bilinearfusion': 'bilinear_fusion',
-    'bilinearfusionnet': 'bilinear_fusion',
-    'latefusion': 'late_fusion',
-    'latefusionnet': 'late_fusion',
-}
+# 完整模式名列表（包含变体）
+VALID_MODES = BASE_MODES + ['LateFusionNet_A', 'LateFusionNet_W']
 
-_INTERNAL_CANONICAL = set(_INTERNAL_TO_SIMPLIFIED.keys())
+
 
 def normalize_mode(mode: str) -> str:
-    """将任意输入（简洁名/旧名/大小写不敏感）规范为内部模式名。"""
+    """将任意输入规范为标准模式名（类名风格）。"""
     if not isinstance(mode, str):
         return mode
     m = mode.strip()
-    if m in _INTERNAL_CANONICAL:
+    # 已是标准名（包括变体）
+    if m in VALID_MODES:
         return m
+    # 尝试别名映射
     ml = m.replace('-', '_').lower()
-    # 直接支持旧名的大小写变体
-    if ml in _INTERNAL_CANONICAL:
-        return ml
-    # 简洁名映射
-    return _SIMPLIFIED_TO_INTERNAL.get(ml, m)
+    return _MODE_ALIASES.get(ml, m)
 
 def to_simplified_mode(mode: str) -> str:
-    """将内部模式名映射为简洁显示名；若已是简洁名则规范后返回。"""
-    internal = normalize_mode(mode)
-    return _INTERNAL_TO_SIMPLIFIED.get(internal, mode)
+    """规范化模式名（保持向后兼容）。"""
+    return normalize_mode(mode)
 
 def get_all_simplified_modes():
-    """返回简洁显示名列表（用于 CLI 默认值与展示）。"""
-    return [
-        _INTERNAL_TO_SIMPLIFIED['path_only'],
-        _INTERNAL_TO_SIMPLIFIED['rad_only'],
-        _INTERNAL_TO_SIMPLIFIED['simple_fusion'],
-        _INTERNAL_TO_SIMPLIFIED['multiscale_fusion'],
-        _INTERNAL_TO_SIMPLIFIED['coattn'],
-        _INTERNAL_TO_SIMPLIFIED['bilinear_fusion'],
-    ]
+    """返回所有可用模式名列表。"""
+    return VALID_MODES.copy()
 
 def get_base_parser():
     """
@@ -132,7 +104,7 @@ def get_base_parser():
     parser.add_argument('--align_loss_weight', type=float, default=0.1, help='两模态投影后特征对齐损失（MSE）的权重；0 关闭')
     parser.add_argument('--modality_dropout_p', type=float, default=0.1, help='训练时随机丢弃任一模态的概率（提升鲁棒性）；0 关闭')
     parser.add_argument('--freeze_encoder_epochs', type=int, default=0, help='前若干个 epoch 冻结编码器，仅训练融合头 (0 表示不冻结)')
-    parser.add_argument('--reg_type', default='rad', type=str, choices=['none', 'path', 'rad', 'fusion'], 
+    parser.add_argument('--reg_type', default='fusion', type=str, choices=['none', 'path', 'rad', 'fusion'], 
                         help='L1正则化的类型。\n'
                              '"rad": (默认) 仅对 MRI 分支正则化。\n'
                              '"fusion": 仅对融合层和后续分类器正则化。\n'
@@ -142,6 +114,13 @@ def get_base_parser():
     # --- 5. 模型专用参数 ---
     parser.add_argument('--act_type', type=str, default='none', help='模型最终输出的激活函数')
     parser.add_argument('--label_dim', type=int, default=1, help='输出维度 (生存分析通常为1)')
+    
+    # --- 5.1 Late Fusion 专用参数 ---
+    parser.add_argument('--late_fusion_mode', type=str, default='avg', choices=['avg', 'max', 'weighted'],
+                        help='Late Fusion 融合策略:\n'
+                             '"avg": 平均融合（默认）- 投票原则，综合两模态意见\n'
+                             '"max": 最大融合 - 最坏情况原则，捕捉局部高风险特征\n'
+                             '"weighted": 可学习权重融合 - 自适应学习最优模态权重')
 
 
     return parser
